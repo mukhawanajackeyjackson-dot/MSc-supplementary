@@ -1,0 +1,198 @@
+# Load libraries
+library(adegenet)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(ggExtra)
+
+# Read in the data
+data <- read_csv("Rhodes/MSc/Write up/R Codes/2025_02_27_MS/2025_02_27_MS/ISSR data matrix/BINMAT analysis/L. carinerostris ISSR (Grouped by sp) Less than 20 filtered subsetted_data 1(in).csv")
+
+# Separate groups from marker data
+groups <- as.factor(data[[2]])
+issr_data <- data[, -(1:2)]
+
+# Deal with missing data - replace -9 with NA
+issr_data[issr_data == -9] <- NA
+issr_data <- as.data.frame(sapply(issr_data, as.numeric))
+
+# Make the genind object
+genind_obj <- df2genind(issr_data, pop = groups, ploidy = 1, type = "PA")
+
+# Quick check
+print(genind_obj)
+cat("\nIndividuals:", nInd(genind_obj))
+cat("\nLoci:", nLoc(genind_obj))
+cat("\nPopulation sizes:\n")
+print(table(pop(genind_obj)))
+
+# Try different numbers of PCs to see which works best
+cat("\n--- Testing PC values ---\n")
+
+test_pcs <- c(3, 5, 7, 10, 12, 15)
+results <- numeric(length(test_pcs))
+
+for(i in 1:length(test_pcs)) {
+  n <- test_pcs[i]
+  cat("Trying", n, "PCs... ")
+  
+  temp_dapc <- dapc(genind_obj, n.pca = n, n.da = 3)
+  predicted <- apply(temp_dapc$posterior, 1, which.max)
+  actual <- as.numeric(groups)
+  results[i] <- sum(predicted == actual) / length(actual)
+  
+  cat(round(results[i] * 100, 1), "%\n")
+}
+
+# Pick the best one (but prefer lower if similar)
+best <- which.max(results)
+chosen_pca <- test_pcs[best]
+
+for(i in 1:(best-1)) {
+  if(results[i] >= results[best] - 0.02) {
+    chosen_pca <- test_pcs[i]
+    break
+  }
+}
+
+cat("\nGoing with", chosen_pca, "PCs (", round(results[which(test_pcs == chosen_pca)] * 100, 1), "% success)\n\n")
+
+# Plot to visualize
+plot(test_pcs, results * 100, type = "b", pch = 19, col = "blue",
+     xlab = "Number of PCs", ylab = "Success Rate (%)",
+     main = "PC Optimization")
+abline(v = chosen_pca, col = "red", lty = 2)
+
+# Run the actual DAPC analysis
+dapc_result <- dapc(genind_obj, n.pca = chosen_pca, n.da = 3)
+summary(dapc_result)
+
+# Check variance explained
+cat("\nVariance per DF:\n")
+var_explained <- dapc_result$eig / sum(dapc_result$eig) * 100
+for(i in 1:length(var_explained)) {
+  cat("DF", i, ":", round(var_explained[i], 2), "%\n")
+}
+
+# Set colors for the groups
+cols <- c("black", "gray", "orange", "purple")
+
+# Basic scatter plot
+scatter(dapc_result, posi.da = "bottomright", bg = "white", 
+        pch = 20, cex = 3, col = cols)
+
+# Assignment quality
+assignplot(dapc_result, cex.lab = 0.7)
+
+# Check posterior probabilities
+posteriors <- dapc_result$posterior
+cat("\nMean posterior probabilities:\n")
+for(i in 1:length(levels(groups))) {
+  grp_idx <- which(groups == levels(groups)[i])
+  cat(levels(groups)[i], ":", round(mean(posteriors[grp_idx, i]), 3), "\n")
+}
+
+# How many got assigned correctly?
+predicted_grp <- apply(posteriors, 1, which.max)
+correct <- sum(predicted_grp == as.numeric(groups))
+cat("\nCorrectly assigned:", correct, "/", nInd(genind_obj))
+cat("\nSuccess rate:", round(100 * correct/nInd(genind_obj), 1), "%\n")
+
+# Variable contributions
+loadingplot(dapc_result$var.contr, threshold = 0.003)
+
+# Save a nice version
+png("dapc_scatterplot_optimized.png", width = 800, height = 600, res = 100)
+scatter(dapc_result, posi.da = "bottomright", bg = "white", 
+        pch = 20, cex = 3, col = cols)
+dev.off()
+
+# Make some ggplot versions
+plot_df <- data.frame(
+  DF1 = dapc_result$ind.coord[, 1],
+  DF2 = if(ncol(dapc_result$ind.coord) >= 2) dapc_result$ind.coord[, 2] else rep(0, nrow(dapc_result$ind.coord)),
+  Group = dapc_result$grp
+)
+
+# Rename groups to actual species names
+levels(plot_df$Group) <- c("Cryophytum crystallinum", "Cryophytum guerichianum", 
+                           "Cryophytum pellitum", "Cryophytum barklyi")
+
+df1_var <- round(var_explained[1], 2)
+df2_var <- if(length(var_explained) >= 2) round(var_explained[2], 2) else 0
+
+# Density plot for DF1
+p1 <- ggplot(plot_df, aes(x = DF1, fill = Group)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(
+    values = cols,
+    labels = c(
+      expression(italic("Cryophytum crystallinum")),
+      expression(italic("Cryophytum guerichianum")),
+      expression(italic("Cryophytum pellitum")),
+      expression(italic("Cryophytum barklyi"))
+    )
+  ) +
+  labs(title = "DF1 Density", 
+       x = paste0("DF1 (", df1_var, "%)"), 
+       y = "Density") +
+  theme_minimal()
+print(p1)
+
+# DF2 density if we have it
+if(ncol(dapc_result$ind.coord) >= 2) {
+  p2 <- ggplot(plot_df, aes(x = DF2, fill = Group)) +
+    geom_density(alpha = 0.5) +
+    scale_fill_manual(
+      values = cols,
+      labels = c(
+        expression(italic("Cryophytum crystallinum")),
+        expression(italic("Cryophytum guerichianum")),
+        expression(italic("Cryophytum pellitum")),
+        expression(italic("Cryophytum barklyi"))
+      )
+    ) +
+    labs(title = "DF2 Density", 
+         x = paste0("DF2 (", df2_var, "%)"), 
+         y = "Density") +
+    theme_minimal()
+  print(p2)
+  
+  # Scatter of DF1 vs DF2
+  p3 <- ggplot(plot_df, aes(x = DF1, y = DF2, color = Group)) +
+    geom_point(size = 3, alpha = 0.7) +
+    scale_color_manual(
+      values = cols,
+      labels = c(
+        expression(italic("Cryophytum crystallinum")),
+        expression(italic("Cryophytum guerichianum")),
+        expression(italic("Cryophytum pellitum")),
+        expression(italic("Cryophytum barklyi"))
+      )
+    ) +
+    labs(title = "DAPC: DF1 vs DF2", 
+         x = paste0("DF1 (", df1_var, "%)"), 
+         y = paste0("DF2 (", df2_var, "%)")) +
+    theme_minimal()
+  print(p3)
+  
+  # With marginal densities
+  p4 <- ggplot(plot_df, aes(x = DF1, y = DF2, color = Group)) +
+    geom_point(size = 3, alpha = 0.7) +
+    scale_color_manual(
+      values = cols,
+      labels = c(
+        expression(italic("Cryophytum crystallinum")),
+        expression(italic("Cryophytum guerichianum")),
+        expression(italic("Cryophytum pellitum")),
+        expression(italic("Cryophytum barklyi"))
+      )
+    ) +
+    labs(x = paste0("DF1 (", df1_var, "%)"), 
+         y = paste0("DF2 (", df2_var, "%)")) +
+    theme_minimal()
+  
+  print(ggMarginal(p4, groupColour = TRUE, groupFill = TRUE, type = "density"))
+}
+
+cat("\nDone!\n")
