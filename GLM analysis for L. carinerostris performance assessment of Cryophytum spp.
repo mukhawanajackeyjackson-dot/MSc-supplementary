@@ -1,0 +1,715 @@
+# Load required packages
+library(ggplot2)
+library(readxl)
+library(dplyr)
+library(MASS)  # For negative binomial GLM
+library(broom)  # For tidy model output
+library(pscl)   # For zero-inflated models and overdispersion tests
+
+# Read the data
+df <- read.csv("Rhodes/MSc/2024 December field trip/Field trip datasheet cm.csv", sep = ";")
+
+# Check the actual column names
+cat("Column names in the dataset:\n")
+print(names(df))
+
+# Clean column names
+names(df) <- gsub("\\s+", " ", trimws(names(df)))
+
+# Print cleaned names to verify
+cat("\nCleaned column names:\n")
+print(names(df))
+
+# Calculate average plant size and prepare data
+df <- df %>%
+  # Remove empty rows first 
+  filter(!is.na(Site) & Site != "") %>%
+  mutate(
+    Avg_Plant_Size = rowMeans(cbind(Longest.stem.1, Longest.stem.2, Longest.stem.3), na.rm = TRUE),
+    Host.plant.species = factor(Host.plant.species)
+  ) %>%
+  # Remove any rows with missing data
+  filter(!is.na(Avg_Plant_Size) & !is.na(Host.plant.species) & Host.plant.species != "")
+
+# SET C. CRYSTALLINUM AS THE REFERENCE CATEGORY
+df$Host.plant.species <- relevel(df$Host.plant.species, ref = "C. crystallinum")
+
+# Check the data after cleaning
+cat("Number of rows after cleaning:", nrow(df), "\n")
+cat("Unique species:", levels(df$Host.plant.species), "\n")
+cat("Reference category:", levels(df$Host.plant.species)[1], "\n")
+cat("Data range - Plant size:", range(df$Avg_Plant_Size), "\n")
+
+# Define response variables
+response_vars <- c(
+  "Number.of.feeding.holes",
+  "Number.of.oviposition.holes", 
+  "Number.of.exit.holes",
+  "Number..of.larvae",
+  "Number.of.pupae",
+  "Number.of.adults"
+)
+
+# Define species labels and colors - ALL 4 SPECIES
+species_labels <- c(
+  "C. crystallinum" = expression(italic("Cryophytum crystallinum")),
+  "C. guerichienum" = expression(italic("Cryophytum guerichianum")),
+  "C. pellitum" = expression(italic("Cryophytum pellitum")),
+  "C. barklyi" = expression(italic("Cryophytum barklyi"))
+)
+
+species_colors <- c(
+  "C. crystallinum" = "black",
+  "C. guerichienum" = "brown",
+  "C. pellitum" = "yellow",
+  "C. barklyi" = "purple"
+)
+
+# Function to test overdispersion
+test_overdispersion <- function(model) {
+  # Calculate overdispersion parameter
+  resid_deviance <- sum(residuals(model, type = "deviance")^2)
+  df_residual <- df.residual(model)
+  overdispersion <- resid_deviance / df_residual
+  
+  # Test significance
+  p_value <- 1 - pchisq(resid_deviance, df_residual)
+  
+  return(list(
+    overdispersion_ratio = overdispersion,
+    p_value = p_value,
+    interpretation = ifelse(overdispersion > 1.5, "Overdispersed", "Not overdispersed")
+  ))
+}
+
+# Function to assess zero-inflation
+assess_zero_inflation <- function(response_var, data) {
+  # Calculate observed proportion of zeros
+  observed_zeros <- sum(data[[response_var]] == 0) / length(data[[response_var]])
+  
+  # Fit Poisson model to estimate expected zeros
+  temp_poisson <- glm(as.formula(paste("`", response_var, "` ~ 1", sep = "")), 
+                      data = data, family = poisson)
+  lambda <- exp(coef(temp_poisson))
+  expected_zeros_poisson <- exp(-lambda)
+  
+  # Fit negative binomial to estimate expected zeros
+  temp_nb <- tryCatch({
+    glm.nb(as.formula(paste("`", response_var, "` ~ 1", sep = "")), data = data)
+  }, error = function(e) NULL)
+  
+  expected_zeros_nb <- if (!is.null(temp_nb)) {
+    mu <- exp(coef(temp_nb))
+    theta <- temp_nb$theta
+    (theta / (theta + mu))^theta
+  } else {
+    NA
+  }
+  
+  # Determine if zero-inflation is present
+  zero_inflated_vs_poisson <- observed_zeros > expected_zeros_poisson + 0.1
+  zero_inflated_vs_nb <- if (!is.na(expected_zeros_nb)) {
+    observed_zeros > expected_zeros_nb + 0.1
+  } else {
+    TRUE
+  }
+  
+  return(list(
+    observed_zeros = observed_zeros,
+    expected_zeros_poisson = expected_zeros_poisson,
+    expected_zeros_nb = expected_zeros_nb,
+    zero_inflated_vs_poisson = zero_inflated_vs_poisson,
+    zero_inflated_vs_nb = zero_inflated_vs_nb,
+    n_zeros = sum(data[[response_var]] == 0),
+    total_n = length(data[[response_var]])
+  ))
+}
+
+# Function to perform Vuong test for model comparison
+vuong_test <- function(model1, model2) {
+  tryCatch({
+    vuong(model1, model2)
+  }, error = function(e) {
+    # Manual Vuong test (if pscl::vuong failed)
+    ll1 <- logLik(model1)
+    ll2 <- logLik(model2)
+    
+    # Point-wise log-likelihood differences
+    n <- nobs(model1)
+    lr_diff <- as.numeric(ll1 - ll2)
+    
+    # Vuong statistic
+    vuong_stat <- sqrt(n) * lr_diff / sqrt(sum((residuals(model1, type = "response") - 
+                                                  residuals(model2, type = "response"))^2))
+    
+    # P-value (two-tailed)
+    p_value <- 2 * (1 - pnorm(abs(vuong_stat)))
+    
+    list(
+      statistic = vuong_stat,
+      p_value = p_value,
+      interpretation = ifelse(p_value < 0.05, 
+                              ifelse(vuong_stat > 0, "Model 1 preferred", "Model 2 preferred"),
+                              "No significant difference")
+    )
+  })
+}
+
+# Enhanced function to compare models and create plots
+analyze_response_variable <- function(var) {
+  cat("\n", rep("=", 80), "\n")
+  cat("ANALYSIS FOR:", var, "\n")
+  cat(rep("=", 80), "\n")
+  
+  # Assess zero-inflation first
+  zero_assessment <- assess_zero_inflation(var, df)
+  cat("\nZERO-INFLATION ASSESSMENT\n")
+  cat(rep("-", 40), "\n")
+  cat("Observed zeros:", zero_assessment$n_zeros, "out of", zero_assessment$total_n, 
+      "(", round(zero_assessment$observed_zeros * 100, 1), "%)\n")
+  cat("Expected zeros (Poisson):", round(zero_assessment$expected_zeros_poisson * 100, 1), "%\n")
+  if (!is.na(zero_assessment$expected_zeros_nb)) {
+    cat("Expected zeros (Neg. Binomial):", round(zero_assessment$expected_zeros_nb * 100, 1), "%\n")
+  }
+  cat("Zero-inflated vs Poisson:", zero_assessment$zero_inflated_vs_poisson, "\n")
+  cat("Zero-inflated vs Neg. Binomial:", zero_assessment$zero_inflated_vs_nb, "\n")
+  
+  # Create formula
+  formula_str <- as.formula(paste0("`", var, "` ~ Avg_Plant_Size + Host.plant.species"))
+  
+  # Fit Poisson GLM
+  cat("\n1. POISSON GLM\n")
+  cat(rep("-", 40), "\n")
+  poisson_model <- glm(formula_str, data = df, family = poisson(link = "log"))
+  print(summary(poisson_model))
+  
+  # Test overdispersion for Poisson
+  overdispersion_test <- test_overdispersion(poisson_model)
+  cat("\nOverdispersion test:\n")
+  cat("Overdispersion ratio:", round(overdispersion_test$overdispersion_ratio, 3), "\n")
+  cat("Interpretation:", overdispersion_test$interpretation, "\n")
+  
+  # Fit Negative Binomial GLM
+  cat("\n2. NEGATIVE BINOMIAL GLM\n")
+  cat(rep("-", 40), "\n")
+  nb_model <- tryCatch({
+    glm.nb(formula_str, data = df)
+  }, error = function(e) {
+    cat("Error fitting negative binomial model:", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (!is.null(nb_model)) {
+    print(summary(nb_model))
+    cat("\nTheta (dispersion parameter):", round(nb_model$theta, 3), "\n")
+  }
+  
+  # Fit Zero-Inflated Poisson (ZIP) if zero-inflation detected
+  zip_model <- NULL
+  if (zero_assessment$zero_inflated_vs_poisson) {
+    cat("\n3. ZERO-INFLATED POISSON (ZIP)\n")
+    cat(rep("-", 40), "\n")
+    zip_model <- tryCatch({
+      zeroinfl(formula_str, data = df, dist = "poisson")
+    }, error = function(e) {
+      cat("Error fitting zero-inflated Poisson model:", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(zip_model)) {
+      print(summary(zip_model))
+    }
+  }
+  
+  # Fit Zero-Inflated Negative Binomial (ZINB) if zero-inflation detected
+  zinb_model <- NULL
+  if (zero_assessment$zero_inflated_vs_nb) {
+    cat("\n4. ZERO-INFLATED NEGATIVE BINOMIAL (ZINB)\n")
+    cat(rep("-", 40), "\n")
+    zinb_model <- tryCatch({
+      zeroinfl(formula_str, data = df, dist = "negbin")
+    }, error = function(e) {
+      cat("Error fitting zero-inflated negative binomial model:", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(zinb_model)) {
+      print(summary(zinb_model))
+    }
+  }
+  
+  # Model comparison using AIC and BIC
+  cat("\n5. MODEL COMPARISON\n")
+  cat(rep("-", 40), "\n")
+  
+  models <- list(
+    "Poisson" = poisson_model,
+    "Negative Binomial" = nb_model,
+    "Zero-Inflated Poisson" = zip_model,
+    "Zero-Inflated Neg. Binomial" = zinb_model
+  )
+  
+  # Remove NULL models
+  models <- models[!sapply(models, is.null)]
+  
+  if (length(models) > 1) {
+    aic_values <- sapply(models, AIC)
+    bic_values <- sapply(models, BIC)
+    
+    comparison_df <- data.frame(
+      Model = names(models),
+      AIC = round(aic_values, 2),
+      BIC = round(bic_values, 2),
+      Delta_AIC = round(aic_values - min(aic_values), 2)
+    )
+    comparison_df <- comparison_df[order(comparison_df$AIC), ]
+    
+    print(comparison_df)
+    cat("\nBest model (lowest AIC):", comparison_df$Model[1], "\n")
+    
+    # Vuong tests for zero-inflated models
+    if (!is.null(zip_model)) {
+      cat("\nVuong test: Poisson vs Zero-Inflated Poisson\n")
+      vuong_zip <- vuong_test(poisson_model, zip_model)
+      if (is.list(vuong_zip)) {
+        cat("Test statistic:", round(vuong_zip$statistic, 3), "\n")
+        cat("P-value:", format.pval(vuong_zip$p_value, digits = 3), "\n")
+        cat("Interpretation:", vuong_zip$interpretation, "\n")
+      }
+    }
+    
+    if (!is.null(zinb_model) && !is.null(nb_model)) {
+      cat("\nVuong test: Negative Binomial vs Zero-Inflated Negative Binomial\n")
+      vuong_zinb <- vuong_test(nb_model, zinb_model)
+      if (is.list(vuong_zinb)) {
+        cat("Test statistic:", round(vuong_zinb$statistic, 3), "\n")
+        cat("P-value:", format.pval(vuong_zinb$p_value, digits = 3), "\n")
+        cat("Interpretation:", vuong_zinb$interpretation, "\n")
+      }
+    }
+  }
+  
+  # Extract p-values for plotting from best model
+  best_model <- models[[comparison_df$Model[1]]]
+  
+  # Get p-value for host plant species effect
+  p_host <- tryCatch({
+    if (inherits(best_model, c("zeroinfl"))) {
+      # For zero-inflated models, get p-value from count component
+      coef_summary <- summary(best_model)$coefficients$count
+      host_rows <- grep("Host.*plant.*species", rownames(coef_summary))
+      if (length(host_rows) > 0) {
+        format.pval(min(coef_summary[host_rows, "Pr(>|z|)"]), digits = 3)
+      } else {
+        "N/A"
+      }
+    } else {
+      # For regular GLMs
+      coef_summary <- summary(best_model)$coefficients
+      host_rows <- grep("Host.*plant.*species", rownames(coef_summary))
+      if (length(host_rows) > 0) {
+        format.pval(min(coef_summary[host_rows, "Pr(>|z|)"]), digits = 3)
+      } else {
+        "N/A"
+      }
+    }
+  }, error = function(e) "N/A")
+  
+  # Create predictions for plotting - wrap in error handling
+  plot_created <- tryCatch({
+    # Create prediction data
+    new_data <- expand.grid(
+      Avg_Plant_Size = seq(min(df$Avg_Plant_Size, na.rm = TRUE), 
+                           max(df$Avg_Plant_Size, na.rm = TRUE), length.out = 50),
+      Host.plant.species = levels(df$Host.plant.species)
+    )
+    
+    # Ensure the factor levels match
+    new_data$Host.plant.species <- factor(new_data$Host.plant.species, 
+                                          levels = levels(df$Host.plant.species))
+    
+    # Make predictions with the best model
+    if (inherits(best_model, c("zeroinfl"))) {
+      # For zero-inflated models
+      predictions <- predict(best_model, newdata = new_data, type = "response")
+      new_data$fitted <- predictions
+    } else {
+      # For regular GLMs
+      pred_obj <- predict(best_model, newdata = new_data, type = "response", se.fit = TRUE)
+      new_data$fitted <- pred_obj$fit
+      new_data$se <- pred_obj$se.fit
+    }
+    
+    # Create plot
+    plot_title <- paste(comparison_df$Model[1], ":", gsub("\\.", " ", var))
+    
+    p <- ggplot(df, aes(x = Avg_Plant_Size, y = .data[[var]], color = Host.plant.species)) +
+      geom_point(alpha = 0.7, size = 2) +
+      geom_line(data = new_data, aes(y = fitted), size = 1) +
+      scale_color_manual(values = species_colors, labels = species_labels) +
+      labs(
+        title = plot_title,
+        x = "Average Plant Size (cm)",
+        y = gsub("\\.", " ", var),
+        caption = paste0("p(Host plant species) = ", p_host, 
+                         " | AIC = ", round(comparison_df$AIC[1], 1)),
+        color = "Species"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.caption = element_text(hjust = 0.5),
+        legend.position = "right"
+      )
+    
+    print(p)
+    
+    # Save the plot automatically IMMEDIATELY after printing
+    plot_filename <- paste0("plot_", gsub("\\.", "_", var), ".png")
+    ggsave(plot_filename, plot = p, width = 12, height = 7, dpi = 300)
+    cat("\n✓ Plot saved as:", plot_filename, "\n")
+    
+    TRUE  # Return success
+    
+  }, error = function(e) {
+    cat("\n✗ Error creating/saving plot:", e$message, "\n")
+    cat("This often happens with sparse data or model convergence issues.\n")
+    cat("Creating simplified plot without fitted lines...\n")
+    
+    # Create simplified plot without predictions
+    tryCatch({
+      plot_title <- paste(comparison_df$Model[1], ":", gsub("\\.", " ", var))
+      
+      p_simple <- ggplot(df, aes(x = Avg_Plant_Size, y = .data[[var]], color = Host.plant.species)) +
+        geom_point(alpha = 0.7, size = 3) +
+        scale_color_manual(values = species_colors, labels = species_labels) +
+        labs(
+          title = paste(plot_title, "(Data only - prediction failed)"),
+          x = "Average Plant Size (cm)",
+          y = gsub("\\.", " ", var),
+          caption = paste0("p(Host plant species) = ", p_host, 
+                           " | AIC = ", round(comparison_df$AIC[1], 1)),
+          color = "Species"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.caption = element_text(hjust = 0.5, size = 9),
+          legend.position = "right",
+          legend.text = element_text(size = 8),
+          legend.title = element_text(size = 9, face = "bold"),
+          legend.key.size = unit(0.6, "cm"),
+          legend.box.margin = margin(0, 0, 0, 5),
+          axis.title.x = element_text(size = 10),
+          axis.title.y = element_text(size = 10),
+          axis.text.x = element_text(size = 9),
+          axis.text.y = element_text(size = 9),
+          plot.title = element_text(size = 11, face = "bold")
+        )
+      
+      print(p_simple)
+      
+      plot_filename <- paste0("plot_", gsub("\\.", "_", var), "_dataonly.png")
+      ggsave(plot_filename, plot = p_simple, width = 12, height = 7, dpi = 300)
+      cat("\n✓ Simplified plot saved as:", plot_filename, "\n")
+      
+    }, error = function(e2) {
+      cat("\n✗ Could not create even simplified plot:", e2$message, "\n")
+    })
+    
+    FALSE  # Return failure
+  })
+  
+  # Residual diagnostics for best model (if it's a regular GLM)
+  if (inherits(best_model, "glm")) {
+    cat("\n6. RESIDUAL DIAGNOSTICS\n")
+    cat(rep("-", 40), "\n")
+    
+    par(mfrow = c(2, 2))
+    
+    # Residuals vs Fitted
+    plot(fitted(best_model), residuals(best_model, type = "deviance"),
+         xlab = "Fitted Values", ylab = "Deviance Residuals",
+         main = "Residuals vs Fitted")
+    abline(h = 0, col = "red", lty = 2)
+    
+    # Q-Q plot
+    qqnorm(residuals(best_model, type = "deviance"), main = "Q-Q Plot")
+    qqline(residuals(best_model, type = "deviance"), col = "red")
+    
+    # Scale-Location
+    sqrt_abs_resid <- sqrt(abs(residuals(best_model, type = "deviance")))
+    plot(fitted(best_model), sqrt_abs_resid,
+         xlab = "Fitted Values", ylab = "√|Deviance Residuals|",
+         main = "Scale-Location")
+    
+    # Cook's Distance
+    plot(cooks.distance(best_model), type = "h",
+         main = "Cook's Distance", ylab = "Cook's Distance")
+    
+    par(mfrow = c(1, 1))
+  }
+  
+  return(list(
+    models = models,
+    best_model = best_model,
+    comparison = comparison_df,
+    zero_assessment = zero_assessment
+  ))
+}
+
+# Run analysis for each response variable
+model_results <- list()
+for (var in response_vars) {
+  model_results[[var]] <- analyze_response_variable(var)
+}
+
+# Print overall summary
+cat("\n", rep("=", 80), "\n")
+cat("ENHANCED MODEL SELECTION SUMMARY\n")
+cat(rep("=", 80), "\n")
+
+# Create summary table
+summary_table <- data.frame(
+  Variable = character(),
+  Best_Model = character(),
+  AIC = numeric(),
+  Zero_Inflation_Present = logical(),
+  Percent_Zeros = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (var in names(model_results)) {
+  result <- model_results[[var]]
+  summary_table <- rbind(summary_table, data.frame(
+    Variable = gsub("\\.", " ", var),
+    Best_Model = result$comparison$Model[1],
+    AIC = result$comparison$AIC[1],
+    Zero_Inflation_Present = result$zero_assessment$zero_inflated_vs_nb,
+    Percent_Zeros = round(result$zero_assessment$observed_zeros * 100, 1),
+    stringsAsFactors = FALSE
+  ))
+}
+
+print(summary_table)
+
+cat("\nGENERAL RECOMMENDATIONS:\n")
+cat(rep("=", 80), "\n")
+cat("1. Zero-inflation assessment compares observed vs expected zeros\n")
+cat("2. Zero-inflated models are fitted when excess zeros are detected\n") 
+cat("3. Vuong tests compare zero-inflated vs standard models\n")
+cat("4. Use the model with lowest AIC for final inference\n")
+cat("5. Consider biological interpretation alongside statistical criteria\n")
+cat("6. Zero-inflated models handle structural zeros (cannot occur) vs sampling zeros\n")
+cat("7. Reference category is now C. crystallinum\n")
+
+
+# DESCRIPTIVE STATISTICS - INCLUDES ALL 4 SPECIES
+# Calculate descriptive statistics for all response variables
+library(dplyr)
+
+# Function to calculate mean and SE
+calculate_descriptive_stats <- function(df, response_vars) {
+  
+  stats_list <- list()
+  
+  for (var in response_vars) {
+    # Calculate statistics by host plant species
+    stats <- df %>%
+      group_by(Host.plant.species) %>%
+      summarise(
+        Variable = var,
+        n = n(),
+        Mean = mean(.data[[var]], na.rm = TRUE),
+        SD = sd(.data[[var]], na.rm = TRUE),
+        SE = sd(.data[[var]], na.rm = TRUE) / sqrt(n()),
+        Min = min(.data[[var]], na.rm = TRUE),
+        Max = max(.data[[var]], na.rm = TRUE),
+        Median = median(.data[[var]], na.rm = TRUE),
+        Q25 = quantile(.data[[var]], 0.25, na.rm = TRUE),
+        Q75 = quantile(.data[[var]], 0.75, na.rm = TRUE),
+        N_zeros = sum(.data[[var]] == 0, na.rm = TRUE),
+        Percent_zeros = round(sum(.data[[var]] == 0, na.rm = TRUE) / n() * 100, 1)
+      ) %>%
+      ungroup()
+    
+    stats_list[[var]] <- stats
+  }
+  
+  # Combine all statistics into one dataframe
+  all_stats <- bind_rows(stats_list)
+  
+  return(all_stats)
+}
+
+# Calculate statistics
+descriptive_stats <- calculate_descriptive_stats(df, response_vars)
+
+# Print the results
+cat("\n", rep("=", 80), "\n")
+cat("DESCRIPTIVE STATISTICS BY HOST PLANT SPECIES\n")
+cat(rep("=", 80), "\n\n")
+
+# Print nicely formatted table
+print(descriptive_stats, n = Inf)
+
+# Create a summary table for manuscript reporting
+# Use dplyr::select() explicitly to avoid conflicts with MASS::select()
+manuscript_table <- descriptive_stats %>%
+  dplyr::select(Variable, Host.plant.species, n, Mean, SE) %>%
+  mutate(
+    Mean_SE = sprintf("%.2f ± %.2f", Mean, SE),
+    Variable = gsub("\\.", " ", Variable)
+  ) %>%
+  dplyr::select(Variable, Host.plant.species, n, Mean_SE)
+
+cat("\n", rep("=", 80), "\n")
+cat("MANUSCRIPT-READY SUMMARY TABLE\n")
+cat(rep("=", 80), "\n\n")
+print(manuscript_table, n = Inf)
+
+# Export to CSV
+write.csv(descriptive_stats, "descriptive_statistics_full.csv", row.names = FALSE)
+write.csv(manuscript_table, "descriptive_statistics_summary.csv", row.names = FALSE)
+
+# Calculate overall statistics (across all species) for comparison
+overall_stats <- df %>%
+  summarise(across(all_of(response_vars), 
+                   list(
+                     Mean = ~mean(., na.rm = TRUE),
+                     SE = ~sd(., na.rm = TRUE) / sqrt(n()),
+                     SD = ~sd(., na.rm = TRUE)
+                   ),
+                   .names = "{.col}_{.fn}"))
+
+cat("\n", rep("=", 80), "\n")
+cat("OVERALL STATISTICS (POOLED ACROSS SPECIES)\n")
+cat(rep("=", 80), "\n\n")
+print(t(overall_stats))
+
+# Optional: Create a visual comparison of means with error bars
+library(ggplot2)
+
+# Reshape data for plotting
+stats_for_plot <- descriptive_stats %>%
+  mutate(Variable_clean = gsub("\\.", " ", Variable))
+
+# Create faceted bar plot with error bars - ALL 4 SPECIES
+comparison_plot <- ggplot(stats_for_plot, 
+                          aes(x = Host.plant.species, y = Mean, fill = Host.plant.species)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +
+  geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), 
+                width = 0.2, position = position_dodge(0.9)) +
+  facet_wrap(~ Variable_clean, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = species_colors, labels = species_labels) +
+  labs(
+    title = "Mean Counts (± SE) by Host Plant Species",
+    x = "Host Plant Species",
+    y = "Mean Count",
+    fill = "Species"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.key.size = unit(0.5, "cm"),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.y = element_text(size = 8),
+    strip.text = element_text(size = 9, face = "bold"),
+    plot.title = element_text(size = 11, face = "bold")
+  )
+
+print(comparison_plot)
+
+# Save the plot
+ggsave("mean_comparison_plot.png", comparison_plot, width = 12, height = 9, dpi = 300)
+
+
+# EXCEL EXPORT - INCLUDES ALL 4 SPECIES
+
+library(dplyr)
+library(readxl)
+library(openxlsx)
+
+#Read data
+df <- read.csv("Rhodes/MSc/2024 December field trip/Field trip datasheet cm.csv", sep = ";")
+
+#Clean column names
+names(df) <- gsub("\\s+", " ", trimws(names(df)))
+
+#Basic cleaning and Avg_Plant_Size
+df <- df %>%
+  filter(!is.na(Site) & Site != "") %>%
+  mutate(
+    Avg_Plant_Size = rowMeans(
+      cbind(Longest.stem.1, Longest.stem.2, Longest.stem.3),
+      na.rm = TRUE
+    ),
+    Host.plant.species = factor(Host.plant.species)
+  ) %>%
+  filter(!is.na(Host.plant.species) & Host.plant.species != "")
+
+# SET C. CRYSTALLINUM AS THE REFERENCE CATEGORY
+df$Host.plant.species <- relevel(df$Host.plant.species, ref = "C. crystallinum")
+
+#Response variables 
+response_vars <- c(
+  "Number.of.feeding.holes",
+  "Number.of.oviposition.holes",
+  "Number.of.exit.holes",
+  "Number..of.larvae",   # note the double dot — keep exactly as the column name
+  "Number.of.pupae",
+  "Number.of.adults"
+)
+
+# keep only response vars that actually exist in the dataset
+response_vars <- response_vars[response_vars %in% names(df)]
+if (length(response_vars) == 0) stop("None of the specified response_vars are present in the data. Check column names with names(df).")
+
+#Function to calculate descriptive stats per species
+calculate_descriptive_stats <- function(df, response_vars) {
+  stats_list <- lapply(response_vars, function(var) {
+    df %>%
+      group_by(Host.plant.species) %>%
+      summarise(
+        Variable = var,
+        n = sum(!is.na(.data[[var]])),           # Number of non-missing obs
+        Mean = mean(.data[[var]], na.rm = TRUE),
+        SD = sd(.data[[var]], na.rm = TRUE),
+        SE = ifelse(n > 0, SD / sqrt(n), NA_real_),
+        Min = min(.data[[var]], na.rm = TRUE),
+        Max = max(.data[[var]], na.rm = TRUE),
+        Median = median(.data[[var]], na.rm = TRUE),
+        Q25 = quantile(.data[[var]], 0.25, na.rm = TRUE),
+        Q75 = quantile(.data[[var]], 0.75, na.rm = TRUE),
+        N_zeros = sum(.data[[var]] == 0, na.rm = TRUE),
+        Percent_zeros = ifelse(n > 0, round(N_zeros / n * 100, 1), NA_real_),
+        .groups = "drop"
+      )
+  })
+  bind_rows(stats_list)
+}
+
+#Calculate stats
+descriptive_stats <- calculate_descriptive_stats(df, response_vars)
+
+#Create manuscript-style summary (Mean ± SE)
+manuscript_table <- descriptive_stats %>%
+  mutate(
+    Variable = gsub("\\.", " ", Variable),
+    Mean_SE = sprintf("%.2f ± %.2f", Mean, SE)
+  ) %>%
+  dplyr::select(Variable, Host.plant.species, n, Mean_SE)  # explicit dplyr::select avoids masking issues
+
+#Save to Excel
+wb <- createWorkbook()
+addWorksheet(wb, "Full Stats")
+addWorksheet(wb, "Summary")
+writeData(wb, "Full Stats", descriptive_stats)
+writeData(wb, "Summary", manuscript_table)
+out_file <- "descriptive_statistics.xlsx"
+saveWorkbook(wb, out_file, overwrite = TRUE)
+
+message("Saved: ", normalizePath(out_file))
