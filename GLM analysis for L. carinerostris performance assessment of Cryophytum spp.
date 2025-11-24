@@ -1,4 +1,4 @@
-
+#install packages if needed
 # Load required packages
 library(ggplot2)
 library(readxl)
@@ -14,7 +14,7 @@ df <- read.csv("Rhodes/MSc/2024 December field trip/Field trip datasheet cm.csv"
 cat("Column names in the dataset:\n")
 print(names(df))
 
-# Clean column names
+# Clean column names by removing empty spaces
 names(df) <- gsub("\\s+", " ", trimws(names(df)))
 
 # Print cleaned names to verify
@@ -51,7 +51,7 @@ response_vars <- c(
   "Number.of.adults"
 )
 
-# Define species labels and colors - ALL 4 SPECIES
+# Define species labels and colors - ALL 4 CRYOPHYTUM SPECIES
 species_labels <- c(
   "C. crystallinum" = expression(italic("Cryophytum crystallinum")),
   "C. guerichienum" = expression(italic("Cryophytum guerichianum")),
