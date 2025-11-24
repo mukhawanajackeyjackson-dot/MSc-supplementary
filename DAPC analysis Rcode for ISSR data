@@ -1,3 +1,4 @@
+#install packages if needed
 # Load libraries
 library(adegenet)
 library(readr)
@@ -44,7 +45,7 @@ for(i in 1:length(test_pcs)) {
   cat(round(results[i] * 100, 1), "%\n")
 }
 
-# Pick the best one (but prefer lower if similar)
+# Pick the best one (but prefer lower if similar in this case 15)
 best <- which.max(results)
 chosen_pca <- test_pcs[best]
 
